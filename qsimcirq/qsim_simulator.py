@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import cirq
+from cirq import value
 
 import numpy as np
 
@@ -109,6 +110,7 @@ class MeasInfo:
         key: The measurement key.
         idx: The "instance" of a possibly-repeated measurement key.
         invert_mask: True for any measurement bits that should be inverted.
+        confusion_map: The confusion matrices for the measurement.
         start: Start index in qsim's output array for this measurement.
         end: End index (non-inclusive) in qsim's output array.
     """
@@ -116,6 +118,7 @@ class MeasInfo:
     key: str
     idx: int
     invert_mask: Tuple[bool, ...]
+    confusion_map: Dict[Tuple[int, ...], np.ndarray]
     start: int
     end: int
 
@@ -223,8 +226,10 @@ class QSimSimulator(
         """
         param_resolver = param_resolver or cirq.ParamResolver({})
         solved_circuit = cirq.resolve_parameters(circuit, param_resolver)
+        results = self._sample_measure_results(solved_circuit, repetitions)
+        # print("_run::results: ", results)
 
-        return self._sample_measure_results(solved_circuit, repetitions)
+        return results
 
     def _sample_measure_results(
         self,
@@ -300,12 +305,14 @@ class QSimSimulator(
                     key=key,
                     idx=i,
                     invert_mask=gate.full_invert_mask(),
+                    confusion_map=gate.confusion_map,
                     start=num_bits,
                     end=num_bits + n,
                 )
             )
             num_bits += n
 
+        # print("_sample_measure_results::meas_infos: ", meas_infos)
         # Set qsim options
         options = {**self.qsim_options}
 
@@ -341,11 +348,16 @@ class QSimSimulator(
             )
 
             for key, oplist in meas_ops.items():
+                # print("_sample_measure_res::oplist: ", oplist, " ::meas_ops: ", meas_ops)
                 for i, op in enumerate(oplist):
+                    # print("_sample_measure_res::op: ", op)
                     meas_indices = [qubit_map[qubit] for qubit in op.qubits]
                     invert_mask = op.gate.full_invert_mask()
-                    # Apply invert mask to re-ordered results
-                    results[key][:, i, :] = full_results[:, meas_indices] ^ invert_mask
+                    # Apply invert mask and confusion matrix to re-ordered results
+                    results[key][:, i, :] = self._confuse_results(
+                            (full_results[:, meas_indices] ^ invert_mask),
+                            op.qubits,
+                            op.gate.confusion_map)
 
         else:
             if noisy:
@@ -366,11 +378,35 @@ class QSimSimulator(
                 measurements[i] = sampler_fn(options)
 
             for m in meas_infos:
-                results[m.key][:, m.idx, :] = (
-                    measurements[:, m.start : m.end] ^ m.invert_mask
-                )
+                results[m.key][:, m.idx, :] = self._confuse_results((
+                        measurements[:, m.start : m.end] ^ m.invert_mask
+                    ), None,  # TODO: Change this
+                    m.confusion_map)
 
         return results
+
+    def _confuse_results(
+        self,
+        bits: np.ndarray,
+        qubits: Sequence['cirq.Qid'],
+        confusion_map: Dict[Tuple[int, ...], np.ndarray],
+        seed: 'cirq.RANDOM_STATE_OR_SEED_LIKE' = None,
+    ) -> None:
+        """Mutates `bits` using the confusion_map.
+
+        Compare with _confuse_result in cirq-core/cirq/sim/simulation_state.py.
+        """
+        prng = value.parse_random_state(seed)
+        for rep in bits:
+            dims = [q.dimension for q in qubits]
+            for indices, confuser in confusion_map.items():
+                mat_dims = [dims[k] for k in indices]
+                row = value.big_endian_digits_to_int((rep[k] for k in indices), base=mat_dims)
+                new_val = prng.choice(len(confuser), p=confuser[row])
+                new_bits = value.big_endian_int_to_digits(new_val, base=mat_dims)
+                for i, k in enumerate(indices):
+                    rep[k] = new_bits[i]
+        return bits
 
     def compute_amplitudes_sweep_iter(
         self,
